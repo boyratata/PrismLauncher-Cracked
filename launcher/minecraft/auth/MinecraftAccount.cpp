@@ -39,9 +39,13 @@
 
 #include <QColor>
 #include <QCryptographicHash>
+#include <QEventLoop>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QRegularExpression>
 #include <QStringList>
 #include <QUuid>
@@ -86,6 +90,35 @@ MinecraftAccountPtr MinecraftAccount::createOffline(const QString& username)
     account->data.minecraftProfile.id = uuidFromUsername(username).toString(QUuid::Id128);
     account->data.minecraftProfile.name = username;
     account->data.minecraftProfile.validity = Validity::Certain;
+
+    QNetworkAccessManager nam;
+    auto doRequest = [&](const QString& url) -> QNetworkReply* {
+        QNetworkRequest r{QUrl(url)};
+        r.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+        return nam.get(r);
+    };
+    QNetworkReply* reply = doRequest("https://skinsystem.ely.by/skins/" + username + ".png");
+    QEventLoop loop;
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    loop.exec();
+    int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308) {
+        QString redirectUrl = reply->header(QNetworkRequest::LocationHeader).toString();
+        reply->deleteLater();
+        reply = doRequest(redirectUrl);
+        QEventLoop loop2;
+        QObject::connect(reply, &QNetworkReply::finished, &loop2, &QEventLoop::quit);
+        loop2.exec();
+    }
+    if (reply->error() == QNetworkReply::NoError) {
+        auto skinData = reply->readAll();
+        qDebug() << "Skin fetch SUCCESS, bytes:" << skinData.size();
+        account->data.minecraftProfile.skin.data = skinData;
+    } else {
+        qDebug() << "Skin fetch FAILED:" << reply->errorString() << reply->url();
+    }
+    reply->deleteLater();
+
     return account;
 }
 
@@ -206,12 +239,6 @@ bool MinecraftAccount::isActive() const
 
 bool MinecraftAccount::shouldRefresh() const
 {
-    /*
-     * Never refresh accounts that are being used by the game, it breaks the game session.
-     * Always refresh accounts that have not been refreshed yet during this session.
-     * Don't refresh broken accounts.
-     * Refresh accounts that would expire in the next 12 hours (fresh token validity is 24 hours).
-     */
     if (isInUse()) {
         return false;
     }
@@ -241,15 +268,11 @@ bool MinecraftAccount::shouldRefresh() const
 
 void MinecraftAccount::fillSession(AuthSessionPtr session)
 {
-    // volatile auth token
     session->access_token = data.accessToken();
-    // profile name
     session->player_name = data.profileName();
-    // profile ID
     session->uuid = data.profileId();
     if (session->uuid.isEmpty())
         session->uuid = uuidFromUsername(session->player_name).toString(QUuid::Id128);
-    // 'legacy' or 'mojang', depending on account type
     session->user_type = typeString();
     if (!session->access_token.isEmpty()) {
         session->session = "token:" + data.accessToken() + ":" + data.profileId();
@@ -263,7 +286,6 @@ void MinecraftAccount::decrementUses()
     Usable::decrementUses();
     if (!isInUse()) {
         emit changed();
-        // FIXME: we now need a better way to identify accounts...
         qWarning() << "Profile" << data.profileId() << "is no longer in use.";
     }
 }
@@ -274,7 +296,6 @@ void MinecraftAccount::incrementUses()
     Usable::incrementUses();
     if (!wasInUse) {
         emit changed();
-        // FIXME: we now need a better way to identify accounts...
         qWarning() << "Profile" << data.profileId() << "is now in use.";
     }
 }
@@ -283,15 +304,14 @@ QUuid MinecraftAccount::uuidFromUsername(QString username)
 {
     auto input = QString("OfflinePlayer:%1").arg(username).toUtf8();
 
-    // basically a reimplementation of Java's UUID#nameUUIDFromBytes
     QByteArray digest = QCryptographicHash::hash(input, QCryptographicHash::Md5);
 
     auto bOr = [](QByteArray& array, qsizetype index, uint8_t value) { array[index] |= value; };
     auto bAnd = [](QByteArray& array, qsizetype index, uint8_t value) { array[index] &= value; };
-    bAnd(digest, 6, 0x0f);  // clear version
-    bOr(digest, 6, 0x30);   // set to version 3
-    bAnd(digest, 8, 0x3f);  // clear variant
-    bOr(digest, 8, 0x80);   // set to IETF variant
+    bAnd(digest, 6, 0x0f);
+    bOr(digest, 6, 0x30);
+    bAnd(digest, 8, 0x3f);
+    bOr(digest, 8, 0x80);
 
     return QUuid::fromRfc4122(digest);
 }
